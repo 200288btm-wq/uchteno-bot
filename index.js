@@ -1,13 +1,16 @@
 import express from 'express'
 import cron from 'node-cron'
 import { createClient } from '@supabase/supabase-js'
+import ws from 'ws'
 
 const app = express()
 app.use(express.json())
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://dmvqiuminxrtcaylfcwg.supabase.co'
 const SUPABASE_KEY = process.env.SUPABASE_KEY
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY)
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
+  realtime: { transport: ws }
+})
 
 // ── Telegram API helper ──────────────────────────────────────
 async function tg(token, method, body) {
