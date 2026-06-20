@@ -12,6 +12,8 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
   realtime: { transport: ws }
 })
 
+const BOT_SERVICE_URL = process.env.BOT_SERVICE_URL || 'https://uchteno-bot-200288btm.amvera.io'
+
 // ── Telegram API helper ──────────────────────────────────────
 async function tg(token, method, body) {
   const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
@@ -79,7 +81,6 @@ async function getClientByTelegram(studioId, telegramId) {
 }
 
 async function findClientByPhone(studioId, phone) {
-  // Нормализуем телефон — убираем всё кроме цифр
   const digits = phone.replace(/\D/g, '')
   const { data: clients } = await supabase
     .from('clients')
@@ -90,7 +91,7 @@ async function findClientByPhone(studioId, phone) {
     const contacts = c.contacts || []
     return contacts.some(contact => {
       const cDigits = (contact.val || '').replace(/\D/g, '')
-      return cDigits.endsWith(digits.slice(-9)) // сравниваем последние 9 цифр
+      return cDigits.endsWith(digits.slice(-9))
     })
   })
 }
@@ -112,8 +113,30 @@ async function getClientBalance(studioId, clientId) {
   return { client, payments: payments || [], totalPaid, totalVisited, balance }
 }
 
-// ── State machine для регистрации ────────────────────────────
-const pendingRegistration = new Map() // telegramId -> { studioId, step }
+// ── Pending registration — хранится в Supabase, а не в памяти ──
+// Это важно: при cold start Map сбрасывается, поэтому используем БД
+
+async function getPendingReg(telegramId) {
+  const { data } = await supabase
+    .from('bot_pending_registration')
+    .select('*')
+    .eq('telegram_id', telegramId)
+    .maybeSingle()
+  return data
+}
+
+async function setPendingReg(telegramId, studioId) {
+  await supabase.from('bot_pending_registration').upsert({
+    telegram_id: telegramId,
+    studio_id: studioId,
+    step: 'phone',
+    created_at: new Date().toISOString(),
+  }, { onConflict: 'telegram_id' })
+}
+
+async function deletePendingReg(telegramId) {
+  await supabase.from('bot_pending_registration').delete().eq('telegram_id', telegramId)
+}
 
 // ── Message handlers ─────────────────────────────────────────
 async function handleMessage(token, studioSettings, msg) {
@@ -122,58 +145,53 @@ async function handleMessage(token, studioSettings, msg) {
   const text = msg.text || ''
   const studioId = studioSettings.studios.id
 
-  // Проверяем привязан ли пользователь
   const linked = await getClientByTelegram(studioId, telegramId)
 
   // Ожидание ввода телефона при регистрации
-  if (pendingRegistration.has(telegramId)) {
-    const state = pendingRegistration.get(telegramId)
-    if (state.step === 'phone') {
-      let phone = text.trim()
-      // Если пользователь поделился контактом
-      if (msg.contact) phone = msg.contact.phone_number
+  const pending = await getPendingReg(telegramId)
+  if (pending && pending.step === 'phone') {
+    let phone = text.trim()
+    if (msg.contact) phone = msg.contact.phone_number
 
-      const client = await findClientByPhone(studioId, phone)
-      if (!client) {
-        await sendMessage(token, chatId,
-          '❌ Клиент с таким номером не найден.\n\nПроверьте номер и попробуйте снова, или обратитесь к администратору студии.',
-          {
-            reply_markup: {
-              keyboard: [[{ text: '📱 Поделиться номером', request_contact: true }]],
-              resize_keyboard: true,
-              one_time_keyboard: true,
-            }
-          }
-        )
-        return
-      }
-
-      // Привязываем
-      await supabase.from('client_telegram').upsert({
-        studio_id: studioId,
-        client_id: client.id,
-        telegram_id: telegramId,
-        telegram_username: msg.from.username,
-        telegram_first_name: msg.from.first_name,
-        phone,
-        notify_before_hours: 2,
-        notify_low_balance: true,
-      }, { onConflict: 'studio_id,telegram_id' })
-
-      pendingRegistration.delete(telegramId)
-
+    const client = await findClientByPhone(studioId, phone)
+    if (!client) {
       await sendMessage(token, chatId,
-        `✅ <b>Привязка выполнена!</b>\n\nДобро пожаловать, <b>${client.child_name}</b>!\n\nТеперь вы можете получать информацию о занятиях и уведомления.`,
-        mainMenu(studioSettings.booking_url)
+        '❌ Клиент с таким номером не найден.\n\nПроверьте номер и попробуйте снова, или обратитесь к администратору студии.',
+        {
+          reply_markup: {
+            keyboard: [[{ text: '📱 Поделиться номером', request_contact: true }]],
+            resize_keyboard: true,
+            one_time_keyboard: true,
+          }
+        }
       )
       return
     }
+
+    await supabase.from('client_telegram').upsert({
+      studio_id: studioId,
+      client_id: client.id,
+      telegram_id: telegramId,
+      telegram_username: msg.from.username,
+      telegram_first_name: msg.from.first_name,
+      phone,
+      notify_before_hours: 2,
+      notify_low_balance: true,
+    }, { onConflict: 'studio_id,telegram_id' })
+
+    await deletePendingReg(telegramId)
+
+    await sendMessage(token, chatId,
+      `✅ <b>Привязка выполнена!</b>\n\nДобро пожаловать, <b>${client.child_name}</b>!\n\nТеперь вы можете получать информацию о занятиях и уведомления.`,
+      mainMenu(studioSettings.booking_url)
+    )
+    return
   }
 
   // Незарегистрированный пользователь
   if (!linked) {
     if (text === '/start') {
-      pendingRegistration.set(telegramId, { studioId, step: 'phone' })
+      await setPendingReg(telegramId, studioId)
       await sendMessage(token, chatId,
         `👋 Добро пожаловать в <b>${studioSettings.studios.name}</b>!\n\nДля начала работы нам нужно вас идентифицировать.\n\n📱 Введите номер телефона, который вы указывали при записи в студию, или нажмите кнопку ниже:`,
         {
@@ -186,9 +204,8 @@ async function handleMessage(token, studioSettings, msg) {
       )
       return
     }
-    // Обработка контакта при регистрации
     if (msg.contact) {
-      pendingRegistration.set(telegramId, { studioId, step: 'phone' })
+      await setPendingReg(telegramId, studioId)
       const phone = msg.contact.phone_number
       const client = await findClientByPhone(studioId, phone)
       if (!client) {
@@ -200,7 +217,7 @@ async function handleMessage(token, studioSettings, msg) {
         telegram_username: msg.from.username, telegram_first_name: msg.from.first_name,
         phone, notify_before_hours: 2, notify_low_balance: true,
       }, { onConflict: 'studio_id,telegram_id' })
-      pendingRegistration.delete(telegramId)
+      await deletePendingReg(telegramId)
       await sendMessage(token, chatId,
         `✅ <b>Привязка выполнена!</b>\n\nДобро пожаловать, <b>${client.child_name}</b>!`,
         mainMenu(studioSettings.booking_url)
@@ -354,7 +371,6 @@ async function handleCallback(token, studioSettings, cbq) {
     await tg(token, 'answerCallbackQuery', { callback_query_id: cbq.id, text: '✅ Сохранено' })
   }
 
-  // Обновляем сообщение
   const { data: settings } = await supabase.from('client_telegram')
     .select('notify_before_hours, notify_low_balance')
     .eq('telegram_id', telegramId).eq('studio_id', studioId).single()
@@ -370,9 +386,8 @@ async function handleCallback(token, studioSettings, cbq) {
 }
 
 // ── Webhook endpoint ─────────────────────────────────────────
-// Один endpoint принимает все боты — определяем по token в URL
 app.post('/webhook/:token', async (req, res) => {
-  res.sendStatus(200) // сразу отвечаем Telegram
+  res.sendStatus(200)
   const token = req.params.token
   const update = req.body
 
@@ -392,17 +407,26 @@ app.post('/webhook/:token', async (req, res) => {
 })
 
 // ── Health check ─────────────────────────────────────────────
-app.get('/', (req, res) => res.json({ status: 'ok', service: 'panda-bot' }))
+app.get('/', (req, res) => res.json({ status: 'ok', service: 'uchteno-bot' }))
+
+// ── Keep-alive: пингуем себя каждые 4 минуты чтобы не засыпать ──
+cron.schedule('*/4 * * * *', async () => {
+  try {
+    await fetch(`${BOT_SERVICE_URL}/`)
+    console.log('Keep-alive ping sent')
+  } catch (e) {
+    console.log('Keep-alive ping failed:', e.message)
+  }
+})
 
 // ── Notifications cron ───────────────────────────────────────
-// Каждые 15 минут проверяем уведомления
 cron.schedule('*/15 * * * *', async () => {
   console.log('Running notifications check...')
   await checkLowBalance()
   await checkLessonReminders()
 })
 
-// Уведомление о низком балансе (1 занятие осталось)
+// Уведомление о низком балансе
 async function checkLowBalance() {
   const { data: linked } = await supabase
     .from('client_telegram')
@@ -417,7 +441,6 @@ async function checkLowBalance() {
     const token = row.studio_settings?.bot_token
     if (!token || !client) continue
 
-    // Считаем баланс
     const { data: payments } = await supabase.from('payments')
       .select('lessons_count, expires_at').eq('client_id', client.id)
     const paid = (payments || [])
@@ -427,13 +450,11 @@ async function checkLowBalance() {
 
     if (balance !== 1) continue
 
-    // Проверяем не отправляли ли уже сегодня
     const { data: log } = await supabase.from('bot_notifications_log')
       .select('id').eq('client_id', client.id).eq('type', 'low_balance')
       .gte('sent_at', today + 'T00:00:00Z').maybeSingle()
     if (log) continue
 
-    // Отправляем
     await sendMessage(token, row.telegram_id,
       `⚠️ <b>Осталось последнее занятие!</b>\n\n` +
       `У ${client.child_name} остался <b>1 урок</b> в абонементе.\n` +
@@ -469,7 +490,6 @@ async function checkLessonReminders() {
     const targetDate = targetTime.toISOString().slice(0, 10)
     const targetHour = targetTime.getHours()
 
-    // Получаем направления клиента
     const { data: directions } = await supabase
       .from('directions')
       .select('*, groups:direction_groups(*)')
@@ -478,7 +498,6 @@ async function checkLessonReminders() {
 
     if (!directions?.length) continue
 
-    // Проверяем есть ли занятие в целевое время
     const DAYS_RU = ['вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб']
     const targetDayRu = DAYS_RU[targetTime.getDay()]
 
@@ -487,20 +506,17 @@ async function checkLessonReminders() {
         const schedule = (group.schedule || '').toLowerCase()
         if (!schedule.includes(targetDayRu)) continue
 
-        // Извлекаем время из расписания (например "Пн/Ср/Пт 10:00")
         const timeMatch = schedule.match(/(\d{1,2}):(\d{2})/)
         if (!timeMatch) continue
         const schedHour = parseInt(timeMatch[1])
         if (Math.abs(schedHour - targetHour) > 0) continue
 
-        // Проверяем не отправляли ли уже
         const refId = `${targetDate}_${dir.id}_${group.id}`
         const { data: log } = await supabase.from('bot_notifications_log')
           .select('id').eq('client_id', client.id).eq('type', 'lesson_reminder')
           .eq('reference_id', refId).maybeSingle()
         if (log) continue
 
-        // Отправляем
         const timeStr = `${schedHour}:${timeMatch[2]}`
         await sendMessage(token, row.telegram_id,
           `📚 <b>Напоминание о занятии</b>\n\n` +
