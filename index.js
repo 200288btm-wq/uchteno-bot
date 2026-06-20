@@ -148,7 +148,8 @@ async function handleMessage(token, studioSettings, msg) {
   const linked = await getClientByTelegram(studioId, telegramId)
 
   // Ожидание ввода телефона при регистрации
-  const pending = await getPendingReg(telegramId)
+  const pending = linked ? null : await getPendingReg(telegramId)
+  if (linked) await deletePendingReg(telegramId) // чистим мусор если вдруг остался
   if (pending && pending.step === 'phone') {
     let phone = text.trim()
     if (msg.contact) phone = msg.contact.phone_number
