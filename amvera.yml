@@ -1,0 +1,12 @@
+meta:
+  environment: node
+  toolchain:
+    name: npm
+    version: "20"
+
+build:
+  additionalCommands: npm install
+
+run:
+  command: node index.js
+  containerPort: 3000
