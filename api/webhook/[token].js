@@ -244,24 +244,22 @@ async function handleCallback(token, studioSettings, cbq) {
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(200).json({ ok: true })
 
-  // Отвечаем Telegram сразу чтобы не было retry
-  res.status(200).json({ ok: true })
-
   const token = req.query.token
   const update = req.body
   console.log('Webhook received, token:', token?.slice(0, 10), 'update keys:', Object.keys(update || {}))
 
   try {
     console.log('Calling getStudioByToken...')
-    const studioSettings = await Promise.race([
-      getStudioByToken(token),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('Supabase timeout after 5s')), 5000))
-    ])
-    if (!studioSettings) { console.log('Unknown token:', token); return }
+    const studioSettings = await getStudioByToken(token)
+    console.log('studioSettings:', studioSettings ? 'found' : 'not found')
+
+    if (!studioSettings) { console.log('Unknown token:', token); return res.status(200).json({ ok: true }) }
 
     if (update.message) await handleMessage(token, studioSettings, update.message)
     if (update.callback_query) await handleCallback(token, studioSettings, update.callback_query)
   } catch (e) {
-    console.error('Webhook error:', e)
+    console.error('Webhook error:', e.message)
   }
+
+  return res.status(200).json({ ok: true })
 }
