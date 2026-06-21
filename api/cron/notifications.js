@@ -21,7 +21,10 @@ async function checkLowBalance() {
       .reduce((s, p) => s + (+p.lessons_count || 0), 0)
     const balance = (client.paid_lessons || 0) + paid - (client.visited_lessons || 0)
 
-    if (balance !== 1) continue
+    // Не уведомляем если абонемент изначально был на 1 занятие
+    const maxLessons = (payments || []).filter(p => !p.expires_at || p.expires_at >= today)
+      .reduce((max, p) => Math.max(max, +p.lessons_count || 0), 0)
+    if (balance !== 1 || maxLessons <= 1) continue
 
     const { data: log } = await supabase.from('bot_notifications_log')
       .select('id').eq('client_id', client.id).eq('type', 'low_balance')

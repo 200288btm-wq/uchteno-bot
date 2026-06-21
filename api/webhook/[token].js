@@ -139,12 +139,10 @@ async function handleMessage(token, studioSettings, msg) {
 
   if (text === '🔔 Настройки уведомлений') {
     const settings = await getClientTelegramSettings(studioId, telegramId)
-    const hoursText = settings.notify_before_hours === 0 ? 'не напоминать' : `за ${settings.notify_before_hours} ч.`
     await sendMessage(token, chatId,
       `🔔 <b>Настройки уведомлений</b>\n\n` +
-      `⏰ Напоминание о занятии: <b>${hoursText}</b>\n` +
-      `📊 Мало занятий (1 осталось): <b>${settings.notify_low_balance ? 'включено' : 'выключено'}</b>\n\n` +
-      `Выберите параметр для изменения:`,
+      `⚠️ Напоминание о балансе — всегда включено\n` +
+      `📅 Напоминания о занятиях (утром): <b>${settings.notify_before_hours > 0 ? 'включено' : 'выключено'}</b>`,
       notifyMenu(settings)
     )
     return
@@ -158,33 +156,27 @@ async function handleMessage(token, studioSettings, msg) {
   await sendMessage(token, chatId, 'Выберите раздел из меню 👇', mainMenu(studioSettings.booking_url))
 }
 
-// ── Callback handler ─────────────────────────────────────────
 async function handleCallback(token, studioSettings, cbq) {
   const telegramId = cbq.from.id
   const chatId = cbq.message.chat.id
   const data = cbq.data
   const studioId = studioSettings.studios.id
 
-  const hoursMap = { notify_1h: 1, notify_2h: 2, notify_3h: 3, notify_24h: 24, notify_48h: 48, notify_0: 0 }
-
-  if (data in hoursMap) {
-    await updateClientTelegram(studioId, telegramId, { notify_before_hours: hoursMap[data] })
-    await tg(token, 'answerCallbackQuery', { callback_query_id: cbq.id, text: '✅ Сохранено' })
-  }
-
-  if (data === 'toggle_low_balance') {
+  if (data === 'toggle_reminders') {
     const cur = await getClientTelegramSettings(studioId, telegramId)
-    await updateClientTelegram(studioId, telegramId, { notify_low_balance: !cur.notify_low_balance })
+    const newVal = cur.notify_before_hours > 0 ? 0 : 24
+    await updateClientTelegram(studioId, telegramId, { notify_before_hours: newVal })
     await tg(token, 'answerCallbackQuery', { callback_query_id: cbq.id, text: '✅ Сохранено' })
   }
 
   const settings = await getClientTelegramSettings(studioId, telegramId)
-  const hoursText = settings.notify_before_hours === 0 ? 'не напоминать' : `за ${settings.notify_before_hours} ч.`
 
   await tg(token, 'editMessageText', {
     chat_id: chatId,
     message_id: cbq.message.message_id,
-    text: `🔔 <b>Настройки уведомлений</b>\n\n⏰ Напоминание: <b>${hoursText}</b>\n📊 Мало занятий: <b>${settings.notify_low_balance ? 'включено' : 'выключено'}</b>\n\nВыберите параметр:`,
+    text: `🔔 <b>Настройки уведомлений</b>\n\n` +
+      `⚠️ Напоминание о балансе — всегда включено\n` +
+      `📅 Напоминания о занятиях (утром): <b>${settings.notify_before_hours > 0 ? 'включено' : 'выключено'}</b>`,
     parse_mode: 'HTML',
     ...notifyMenu(settings),
   })
