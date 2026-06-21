@@ -1,7 +1,9 @@
 import {
-  supabase, tg, sendMessage, mainMenu, notifyMenu,
+  tg, sendMessage, mainMenu, notifyMenu,
   getStudioByToken, getClientByTelegram, findClientByPhone,
-  getClientBalance, getPendingReg, setPendingReg, deletePendingReg
+  getClientBalance, getPendingReg, setPendingReg, deletePendingReg,
+  upsertClientTelegram, updateClientTelegram, getClientTelegramSettings,
+  sbGet
 } from '../../lib/helpers.js'
 
 // ── Message handler ──────────────────────────────────────────
@@ -12,8 +14,6 @@ async function handleMessage(token, studioSettings, msg) {
   const studioId = studioSettings.studios.id
 
   const linked = await getClientByTelegram(studioId, telegramId)
-
-  // Если привязан — чистим pending мусор и идём дальше
   const pending = linked ? null : await getPendingReg(telegramId)
   if (linked) await deletePendingReg(telegramId)
 
@@ -26,25 +26,17 @@ async function handleMessage(token, studioSettings, msg) {
     if (!client) {
       await sendMessage(token, chatId,
         '❌ Клиент с таким номером не найден.\n\nПроверьте номер и попробуйте снова, или обратитесь к администратору студии.',
-        {
-          reply_markup: {
-            keyboard: [[{ text: '📱 Поделиться номером', request_contact: true }]],
-            resize_keyboard: true,
-            one_time_keyboard: true,
-          }
-        }
+        { reply_markup: { keyboard: [[{ text: '📱 Поделиться номером', request_contact: true }]], resize_keyboard: true, one_time_keyboard: true } }
       )
       return
     }
 
-    await supabase.from('client_telegram').upsert({
+    await upsertClientTelegram({
       studio_id: studioId, client_id: client.id, telegram_id: telegramId,
       telegram_username: msg.from.username, telegram_first_name: msg.from.first_name,
       phone, notify_before_hours: 2, notify_low_balance: true,
-    }, { onConflict: 'studio_id,telegram_id' })
-
+    })
     await deletePendingReg(telegramId)
-
     await sendMessage(token, chatId,
       `✅ <b>Привязка выполнена!</b>\n\nДобро пожаловать, <b>${client.child_name}</b>!\n\nТеперь вы можете получать информацию о занятиях и уведомления.`,
       mainMenu(studioSettings.booking_url)
@@ -58,29 +50,22 @@ async function handleMessage(token, studioSettings, msg) {
       await setPendingReg(telegramId, studioId)
       await sendMessage(token, chatId,
         `👋 Добро пожаловать в <b>${studioSettings.studios.name}</b>!\n\nДля начала работы нам нужно вас идентифицировать.\n\n📱 Введите номер телефона, который вы указывали при записи в студию, или нажмите кнопку ниже:`,
-        {
-          reply_markup: {
-            keyboard: [[{ text: '📱 Поделиться номером', request_contact: true }]],
-            resize_keyboard: true,
-            one_time_keyboard: true,
-          }
-        }
+        { reply_markup: { keyboard: [[{ text: '📱 Поделиться номером', request_contact: true }]], resize_keyboard: true, one_time_keyboard: true } }
       )
       return
     }
     if (msg.contact) {
-      await setPendingReg(telegramId, studioId)
       const phone = msg.contact.phone_number
       const client = await findClientByPhone(studioId, phone)
       if (!client) {
         await sendMessage(token, chatId, '❌ Клиент с таким номером не найден. Обратитесь к администратору студии.')
         return
       }
-      await supabase.from('client_telegram').upsert({
+      await upsertClientTelegram({
         studio_id: studioId, client_id: client.id, telegram_id: telegramId,
         telegram_username: msg.from.username, telegram_first_name: msg.from.first_name,
         phone, notify_before_hours: 2, notify_low_balance: true,
-      }, { onConflict: 'studio_id,telegram_id' })
+      })
       await deletePendingReg(telegramId)
       await sendMessage(token, chatId,
         `✅ <b>Привязка выполнена!</b>\n\nДобро пожаловать, <b>${client.child_name}</b>!`,
@@ -94,16 +79,14 @@ async function handleMessage(token, studioSettings, msg) {
 
   const client = linked.clients
 
-  // ── /start или главное меню ──
   if (text === '/start' || text === '🏠 Главное меню') {
     await sendMessage(token, chatId, `👋 Привет, ${client.child_name}! Выберите раздел:`, mainMenu(studioSettings.booking_url))
     return
   }
 
-  // ── Моя информация ──
   if (text === '👤 Моя информация') {
-    const { data: dirs } = await supabase.from('directions')
-      .select('name').eq('studio_id', studioId).in('id', client.direction_ids || [])
+    const dirIds = (client.direction_ids || []).join(',')
+    const dirs = dirIds ? await sbGet('directions', `studio_id=eq.${studioId}&id=in.(${dirIds})`) : []
     const dirNames = (dirs || []).map(d => d.name).join(', ') || 'не указано'
     const contacts = (client.contacts || []).map(c => `${c.type}: ${c.val}`).join('\n') || 'не указано'
 
@@ -118,10 +101,8 @@ async function handleMessage(token, studioSettings, msg) {
     return
   }
 
-  // ── Оплаты и баланс ──
   if (text === '💳 Оплаты и баланс') {
     const { totalPaid, totalVisited, balance, payments } = await getClientBalance(studioId, client.id)
-
     const lastPayments = payments
       .sort((a, b) => new Date(b.payment_date) - new Date(a.payment_date))
       .slice(0, 5)
@@ -132,7 +113,6 @@ async function handleMessage(token, studioSettings, msg) {
       }).join('\n')
 
     const balanceEmoji = balance > 0 ? '✅' : balance === 0 ? '⚠️' : '❌'
-
     await sendMessage(token, chatId,
       `💳 <b>Оплаты и баланс</b>\n\n` +
       `${balanceEmoji} Баланс: <b>${balance} зан.</b>\n` +
@@ -143,42 +123,23 @@ async function handleMessage(token, studioSettings, msg) {
     return
   }
 
-  // ── Мои посещения ──
   if (text === '📅 Мои посещения') {
-    const { data: attendance } = await supabase
-      .from('attendance')
-      .select('*, directions(name)')
-      .eq('client_id', client.id)
-      .eq('studio_id', studioId)
-      .order('date', { ascending: false })
-      .limit(10)
-
+    const attendance = await sbGet('attendance', `client_id=eq.${client.id}&studio_id=eq.${studioId}&order=date.desc&limit=10`)
     if (!attendance?.length) {
       await sendMessage(token, chatId, '📅 Посещений пока нет.')
       return
     }
-
     const rows = attendance.map(a => {
       const date = new Date(a.date).toLocaleDateString('ru-RU')
-      const status = a.present ? '✅' : '❌'
-      return `${status} ${date} — ${a.directions?.name || '—'}`
+      return `${a.present ? '✅' : '❌'} ${date}`
     }).join('\n')
-
-    await sendMessage(token, chatId, `📅 <b>Последние 10 посещений</b>\n\n${rows}`)
+    await sendMessage(token, chatId, `📅 <b>Последние посещения</b>\n\n${rows}`)
     return
   }
 
-  // ── Настройки уведомлений ──
   if (text === '🔔 Настройки уведомлений') {
-    const { data: settings } = await supabase
-      .from('client_telegram')
-      .select('notify_before_hours, notify_low_balance')
-      .eq('telegram_id', telegramId)
-      .eq('studio_id', studioId)
-      .single()
-
+    const settings = await getClientTelegramSettings(studioId, telegramId)
     const hoursText = settings.notify_before_hours === 0 ? 'не напоминать' : `за ${settings.notify_before_hours} ч.`
-
     await sendMessage(token, chatId,
       `🔔 <b>Настройки уведомлений</b>\n\n` +
       `⏰ Напоминание о занятии: <b>${hoursText}</b>\n` +
@@ -189,15 +150,11 @@ async function handleMessage(token, studioSettings, msg) {
     return
   }
 
-  // ── Онлайн-запись ──
   if (text === '📝 Онлайн-запись' && studioSettings.booking_url) {
-    await sendMessage(token, chatId,
-      `📝 <b>Онлайн-запись</b>\n\nПерейдите по ссылке:\n${studioSettings.booking_url}`
-    )
+    await sendMessage(token, chatId, `📝 <b>Онлайн-запись</b>\n\nПерейдите по ссылке:\n${studioSettings.booking_url}`)
     return
   }
 
-  // Default
   await sendMessage(token, chatId, 'Выберите раздел из меню 👇', mainMenu(studioSettings.booking_url))
 }
 
@@ -211,24 +168,17 @@ async function handleCallback(token, studioSettings, cbq) {
   const hoursMap = { notify_1h: 1, notify_2h: 2, notify_3h: 3, notify_24h: 24, notify_48h: 48, notify_0: 0 }
 
   if (data in hoursMap) {
-    await supabase.from('client_telegram')
-      .update({ notify_before_hours: hoursMap[data] })
-      .eq('telegram_id', telegramId).eq('studio_id', studioId)
+    await updateClientTelegram(studioId, telegramId, { notify_before_hours: hoursMap[data] })
     await tg(token, 'answerCallbackQuery', { callback_query_id: cbq.id, text: '✅ Сохранено' })
   }
 
   if (data === 'toggle_low_balance') {
-    const { data: cur } = await supabase.from('client_telegram')
-      .select('notify_low_balance').eq('telegram_id', telegramId).eq('studio_id', studioId).single()
-    await supabase.from('client_telegram')
-      .update({ notify_low_balance: !cur.notify_low_balance })
-      .eq('telegram_id', telegramId).eq('studio_id', studioId)
+    const cur = await getClientTelegramSettings(studioId, telegramId)
+    await updateClientTelegram(studioId, telegramId, { notify_low_balance: !cur.notify_low_balance })
     await tg(token, 'answerCallbackQuery', { callback_query_id: cbq.id, text: '✅ Сохранено' })
   }
 
-  const { data: settings } = await supabase.from('client_telegram')
-    .select('notify_before_hours, notify_low_balance')
-    .eq('telegram_id', telegramId).eq('studio_id', studioId).single()
+  const settings = await getClientTelegramSettings(studioId, telegramId)
   const hoursText = settings.notify_before_hours === 0 ? 'не напоминать' : `за ${settings.notify_before_hours} ч.`
 
   await tg(token, 'editMessageText', {
@@ -249,7 +199,6 @@ export default async function handler(req, res) {
   console.log('Webhook received, token:', token?.slice(0, 10), 'update keys:', Object.keys(update || {}))
 
   try {
-    console.log('Calling getStudioByToken...')
     const studioSettings = await getStudioByToken(token)
     console.log('studioSettings:', studioSettings ? 'found' : 'not found')
 
