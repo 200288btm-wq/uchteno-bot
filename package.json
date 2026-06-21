@@ -6,6 +6,7 @@
     "node": "20.x"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.39.0"
+    "@supabase/supabase-js": "^2.39.0",
+    "ws": "^8.18.0"
   }
 }
