@@ -252,7 +252,11 @@ export default async function handler(req, res) {
   console.log('Webhook received, token:', token?.slice(0, 10), 'update keys:', Object.keys(update || {}))
 
   try {
-    const studioSettings = await getStudioByToken(token)
+    console.log('Calling getStudioByToken...')
+    const studioSettings = await Promise.race([
+      getStudioByToken(token),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Supabase timeout after 5s')), 5000))
+    ])
     if (!studioSettings) { console.log('Unknown token:', token); return }
 
     if (update.message) await handleMessage(token, studioSettings, update.message)
