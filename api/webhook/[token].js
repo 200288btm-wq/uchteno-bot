@@ -249,6 +249,7 @@ export default async function handler(req, res) {
 
   const token = req.query.token
   const update = req.body
+  console.log('Webhook received, token:', token?.slice(0, 10), 'update keys:', Object.keys(update || {}))
 
   try {
     const studioSettings = await getStudioByToken(token)
