@@ -25,11 +25,11 @@ async function checkLowBalance() {
 
     const { data: log } = await supabase.from('bot_notifications_log')
       .select('id').eq('client_id', client.id).eq('type', 'low_balance')
-      .gte('sent_at', today + 'T00:00:00Z').maybeSingle()
+      .eq('reference_id', today).maybeSingle()
     if (log) continue
 
     await sendMessage(token, row.telegram_id,
-      `⚠️ <b>Осталось последнее занятие!</b>\n\nУ ${client.child_name} остался <b>1 урок</b>.\nНе забудьте пополнить баланс 😊`
+      `⚠️ <b>Осталось последнее занятие!</b>\n\nУ ${client.child_name} остался <b>1 урок</b> в абонементе.\nНе забудьте пополнить баланс 😊`
     )
 
     await supabase.from('bot_notifications_log').insert({
@@ -41,25 +41,22 @@ async function checkLowBalance() {
 
 async function checkLessonReminders() {
   const now = new Date()
+  const DAYS_RU = ['вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб']
+  const today = now.toISOString().slice(0, 10)
+  const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+
   const { data: linked } = await supabase
     .from('client_telegram')
     .select('*, clients(*), studio_settings!inner(bot_token, studios(id))')
-    .gt('notify_before_hours', 0)
+    .eq('notify_low_balance', true)
 
   if (!linked) return
-
-  const DAYS_RU = ['вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб']
 
   for (const row of linked) {
     const client = row.clients
     const token = row.studio_settings?.bot_token
     const studioId = row.studio_settings?.studios?.id
     if (!token || !client || !studioId) continue
-
-    const targetTime = new Date(now.getTime() + row.notify_before_hours * 60 * 60 * 1000)
-    const targetDate = targetTime.toISOString().slice(0, 10)
-    const targetHour = targetTime.getHours()
-    const targetDayRu = DAYS_RU[targetTime.getDay()]
 
     const { data: directions } = await supabase
       .from('directions')
@@ -69,40 +66,44 @@ async function checkLessonReminders() {
 
     if (!directions?.length) continue
 
-    for (const dir of directions) {
-      for (const group of (dir.groups || [])) {
-        const schedule = (group.schedule || '').toLowerCase()
-        if (!schedule.includes(targetDayRu)) continue
+    for (const checkDate of [today, tomorrow]) {
+      const dayRu = DAYS_RU[new Date(checkDate).getDay()]
+      const label = checkDate === today ? 'Сегодня' : 'Завтра'
 
-        const timeMatch = schedule.match(/(\d{1,2}):(\d{2})/)
-        if (!timeMatch) continue
-        if (Math.abs(parseInt(timeMatch[1]) - targetHour) > 0) continue
+      for (const dir of directions) {
+        for (const group of (dir.groups || [])) {
+          const schedule = (group.schedule || '').toLowerCase()
+          if (!schedule.includes(dayRu)) continue
 
-        const refId = `${targetDate}_${dir.id}_${group.id}`
-        const { data: log } = await supabase.from('bot_notifications_log')
-          .select('id').eq('client_id', client.id).eq('type', 'lesson_reminder')
-          .eq('reference_id', refId).maybeSingle()
-        if (log) continue
+          const timeMatch = schedule.match(/(\d{1,2}):(\d{2})/)
+          const timeStr = timeMatch ? `${timeMatch[1]}:${timeMatch[2]}` : ''
+          const refId = `${checkDate}_${dir.id}_${group.id}_morning`
 
-        await sendMessage(token, row.telegram_id,
-          `📚 <b>Напоминание о занятии</b>\n\nСегодня в <b>${timeMatch[1]}:${timeMatch[2]}</b> у ${client.child_name}:\n<b>${dir.name}</b>`
-        )
+          const { data: log } = await supabase.from('bot_notifications_log')
+            .select('id').eq('client_id', client.id).eq('type', 'lesson_reminder')
+            .eq('reference_id', refId).maybeSingle()
+          if (log) continue
 
-        await supabase.from('bot_notifications_log').insert({
-          studio_id: row.studio_id, client_id: client.id,
-          telegram_id: row.telegram_id, type: 'lesson_reminder', reference_id: refId,
-        })
+          await sendMessage(token, row.telegram_id,
+            `📚 <b>${label} занятие!</b>\n\n` +
+            `${label} ${timeStr ? `в <b>${timeStr}</b> ` : ''}у <b>${client.child_name}</b>:\n` +
+            `<b>${dir.name}</b>`
+          )
+
+          await supabase.from('bot_notifications_log').insert({
+            studio_id: row.studio_id, client_id: client.id,
+            telegram_id: row.telegram_id, type: 'lesson_reminder', reference_id: refId,
+          })
+        }
       }
     }
   }
 }
 
 export default async function handler(req, res) {
-  // Защита — только Vercel Cron может вызвать
   if (req.headers['authorization'] !== `Bearer ${process.env.CRON_SECRET}`) {
     return res.status(401).json({ error: 'Unauthorized' })
   }
-
   try {
     await checkLowBalance()
     await checkLessonReminders()
