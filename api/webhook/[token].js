@@ -12,6 +12,10 @@ async function handleMessage(token, studioSettings, msg) {
   const telegramId = msg.from.id
   const text = msg.text || ''
   const studioId = studioSettings.studios.id
+  // Ссылка на онлайн-запись строится из слага студии (как в CRM); откат на старое поле booking_url
+  const bookingUrl = studioSettings.slug
+    ? `https://panda-crm.vercel.app/zapis/${studioSettings.slug}`
+    : (studioSettings.booking_url || null)
 
   const linked = await getClientByTelegram(studioId, telegramId)
   const pending = linked ? null : await getPendingReg(telegramId)
@@ -39,7 +43,7 @@ async function handleMessage(token, studioSettings, msg) {
     await deletePendingReg(telegramId)
     await sendMessage(token, chatId,
       `✅ <b>Привязка выполнена!</b>\n\nДобро пожаловать, <b>${client.child_name}</b>!\n\nТеперь вы можете получать информацию о занятиях и уведомления.`,
-      mainMenu(studioSettings.booking_url)
+      mainMenu(bookingUrl)
     )
     return
   }
@@ -69,7 +73,7 @@ async function handleMessage(token, studioSettings, msg) {
       await deletePendingReg(telegramId)
       await sendMessage(token, chatId,
         `✅ <b>Привязка выполнена!</b>\n\nДобро пожаловать, <b>${client.child_name}</b>!`,
-        mainMenu(studioSettings.booking_url)
+        mainMenu(bookingUrl)
       )
       return
     }
@@ -80,7 +84,7 @@ async function handleMessage(token, studioSettings, msg) {
   const client = linked.clients
 
   if (text === '/start' || text === '🏠 Главное меню') {
-    await sendMessage(token, chatId, `👋 Привет, ${client.child_name}! Выберите раздел:`, mainMenu(studioSettings.booking_url))
+    await sendMessage(token, chatId, `👋 Привет, ${client.child_name}! Выберите раздел:`, mainMenu(bookingUrl))
     return
   }
 
@@ -148,12 +152,12 @@ async function handleMessage(token, studioSettings, msg) {
     return
   }
 
-  if (text === '📝 Онлайн-запись' && studioSettings.booking_url) {
-    await sendMessage(token, chatId, `📝 <b>Онлайн-запись</b>\n\nПерейдите по ссылке:\n${studioSettings.booking_url}`)
+  if (text === '📝 Онлайн-запись' && bookingUrl) {
+    await sendMessage(token, chatId, `📝 <b>Онлайн-запись</b>\n\nПерейдите по ссылке:\n${bookingUrl}`)
     return
   }
 
-  await sendMessage(token, chatId, 'Выберите раздел из меню 👇', mainMenu(studioSettings.booking_url))
+  await sendMessage(token, chatId, 'Выберите раздел из меню 👇', mainMenu(bookingUrl))
 }
 
 async function handleCallback(token, studioSettings, cbq) {
