@@ -39,10 +39,38 @@ const weekdayRu = (isoDate) => {
   return DAYS_RU[new Date(Date.UTC(y, m - 1, d)).getUTCDay()]
 }
 
+// ── Статус клиента: что он разрешает ─────────────────────────────────
+//
+// ⚠️ Копия правил из CRM `src/lib/clientStatus.js`. Общий импорт
+// недоступен — бот это отдельное приложение на Vercel. При изменении
+// модели статусов править ОБА места (как с расчётом баланса).
+//
+// До 19.08.2026 фильтра по статусу здесь не было вовсе: бот писал всем,
+// у кого есть привязка в client_telegram. Ушедший ребёнок продолжал
+// получать «у вас закончились занятия» — при том, что в CRM его уже
+// убрали в архив и из списка должников он пропал.
+//
+// Какая галочка что решает:
+//   in_stats    — напоминания про остаток и долг (это денежная тема)
+//   in_schedule — напоминания «сегодня/завтра занятие»
+// «Временно отсутствует» остаётся в расчётах, поэтому про долг ему
+// напомнят, а про занятие — нет: в расписании его нет.
+const LEGACY_ACTIVE = 'Активен'
+
+function statusAllows(ctx, row, client, flag) {
+  const s = ctx.statuses.get(`${row.studio_id}|${client.status}`)
+  // Статуса нет в справочнике (импорт, старые записи) — ведём себя так
+  // же, как CRM: такой клиент не в расписании и не в расчётах.
+  if (!s) return client.status === LEGACY_ACTIVE
+  return s[flag] === true
+}
+
 // ── Общая подготовка: привязки + настройки студий ────────────────────
 async function loadContext() {
   const links = await sbGet('client_telegram', 'select=*')
-  if (!Array.isArray(links) || !links.length) return { links: [], studios: new Map(), clients: new Map() }
+  if (!Array.isArray(links) || !links.length) {
+    return { links: [], studios: new Map(), clients: new Map(), statuses: new Map() }
+  }
 
   const studioIds = [...new Set(links.map(l => l.studio_id).filter(Boolean))]
   const clientIds = [...new Set(links.map(l => l.client_id).filter(Boolean))]
@@ -53,11 +81,16 @@ async function loadContext() {
   const clients = clientIds.length
     ? await sbGet('clients', `id=in.(${clientIds.join(',')})&select=*`)
     : []
+  const statuses = studioIds.length
+    ? await sbGet('client_statuses', `studio_id=in.(${studioIds.join(',')})&select=studio_id,name,in_schedule,in_stats`)
+    : []
 
   return {
     links,
     studios: new Map((settings || []).map(s => [s.studio_id, s])),
     clients: new Map((clients || []).map(c => [c.id, c])),
+    // Ключ со studio_id: названия статусов у студий свои и совпадают
+    statuses: new Map((statuses || []).map(s => [`${s.studio_id}|${s.name}`, s])),
   }
 }
 
@@ -78,6 +111,10 @@ async function checkLowBalance(ctx, stats) {
     const studio = ctx.studios.get(row.studio_id)
     const client = ctx.clients.get(row.client_id)
     if (!studio?.bot_token || !client) continue
+
+    // Архивный из списка должников в CRM пропал — значит и писать ему
+    // про долг больше некому и незачем
+    if (!statusAllows(ctx, row, client, 'in_stats')) { stats.skipped_status++; continue }
 
     try {
       const today = localToday(studio.timezone)
@@ -127,6 +164,9 @@ async function checkLessonReminders(ctx, stats) {
     const studio = ctx.studios.get(row.studio_id)
     const client = ctx.clients.get(row.client_id)
     if (!studio?.bot_token || !client) continue
+
+    // В расписании его нет — напоминать не о чем
+    if (!statusAllows(ctx, row, client, 'in_schedule')) { stats.skipped_status++; continue }
 
     try {
       const dirIds = client.direction_ids || []
@@ -181,7 +221,10 @@ export default async function handler(req, res) {
     return res.status(401).json({ error: 'Unauthorized' })
   }
 
-  const stats = { low_balance: 0, lesson_reminder: 0, errors: [] }
+  // skipped_status — сколько раз уведомление не ушло из-за статуса.
+  // Без счётчика фильтр работал бы молча, и «бот перестал писать»
+  // пришлось бы искать вслепую.
+  const stats = { low_balance: 0, lesson_reminder: 0, skipped_status: 0, errors: [] }
   try {
     const ctx = await loadContext()
     await checkLowBalance(ctx, stats)
