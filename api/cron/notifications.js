@@ -14,7 +14,7 @@
 //   9. Ошибка по одному родителю больше не роняет всю рассылку.
 // =====================================================================
 
-import { sbGet, sendMessage, insertNotificationLog } from '../../lib/helpers.js'
+import { sbGet, sendMessage, insertNotificationLog, confirmMenu } from '../../lib/helpers.js'
 
 const DAYS_RU = ['вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб']
 
@@ -196,10 +196,14 @@ async function checkLessonReminders(ctx, stats) {
 
             if (await alreadySent(client.id, 'lesson_reminder', refId)) continue
 
+            // Кнопки «Придём / Не сможем». Ключ занятия едет в
+            // callback_data — в базе занятия нет, привязаться не к чему
             await sendMessage(studio.bot_token, row.telegram_id,
               `📚 <b>${label} занятие</b>\n\n` +
               `${label}${timeStr ? ` в <b>${timeStr}</b>` : ''} у <b>${client.child_name}</b>:\n` +
-              `<b>${dir.name}</b>`
+              `<b>${dir.name}</b>\n\n` +
+              `Подскажете, будете ли?`,
+              confirmMenu(checkDate, dir.id, group.id)
             )
             await insertNotificationLog({
               studio_id: row.studio_id, client_id: client.id,

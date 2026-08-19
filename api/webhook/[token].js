@@ -3,6 +3,7 @@ import {
   getStudioByToken, getClientByTelegram, findClientByPhone,
   getClientBalance, getPendingReg, setPendingReg, deletePendingReg,
   upsertClientTelegram, updateClientTelegram, getClientTelegramSettings,
+  confirmMenu, saveConfirmation,
   sbGet
 } from '../../lib/helpers.js'
 
@@ -160,30 +161,85 @@ async function handleMessage(token, studioSettings, msg) {
   await sendMessage(token, chatId, 'Выберите раздел из меню 👇', mainMenu(bookingUrl))
 }
 
+// Подтверждение занятия: callback_data вида «cf:2026-08-20:12:34».
+// cf — придём, cd — не сможем; дальше дата, направление, подгруппа.
+async function handleConfirm(token, studioId, cbq) {
+  const [kind, lessonDate, dirId, groupId] = String(cbq.data).split(':')
+  const status = kind === 'cf' ? 'confirmed' : 'declined'
+
+  const link = await getClientByTelegram(studioId, cbq.from.id)
+  if (!link?.client_id) {
+    await tg(token, 'answerCallbackQuery', {
+      callback_query_id: cbq.id, show_alert: true,
+      text: 'Не нашли ваш профиль. Напишите /start, чтобы подключиться заново.',
+    })
+    return
+  }
+
+  try {
+    await saveConfirmation({
+      studioId, clientId: link.client_id, lessonDate,
+      directionId: +dirId, groupId: +groupId || 0, status,
+    })
+  } catch (e) {
+    // Сообщаем честно: зелёная галочка на неудаче хуже, чем ошибка
+    console.error('confirm save failed:', e.message)
+    await tg(token, 'answerCallbackQuery', {
+      callback_query_id: cbq.id, show_alert: true,
+      text: 'Не получилось сохранить. Попробуйте ещё раз.',
+    })
+    return
+  }
+
+  await tg(token, 'answerCallbackQuery', {
+    callback_query_id: cbq.id,
+    text: status === 'confirmed' ? '✅ Ждём вас!' : '❌ Спасибо, передали педагогу',
+  })
+
+  // Правим только клавиатуру, не текст: в cbq.message.text разметка
+  // уже съедена, и переотправка сломала бы жирный шрифт
+  await tg(token, 'editMessageReplyMarkup', {
+    chat_id: cbq.message.chat.id,
+    message_id: cbq.message.message_id,
+    ...confirmMenu(lessonDate, dirId, groupId, status),
+  })
+}
+
 async function handleCallback(token, studioSettings, cbq) {
   const telegramId = cbq.from.id
   const chatId = cbq.message.chat.id
-  const data = cbq.data
+  const data = cbq.data || ''
   const studioId = studioSettings.studios.id
+
+  // Каждая ветка завершается сама. Раньше обработчик после любого
+  // нажатия безусловно переписывал сообщение меню настроек — пока
+  // callback был один, это не мешало, но кнопка «Придём» превратила
+  // бы напоминание о занятии в «Настройки уведомлений»
+  if (data.startsWith('cf:') || data.startsWith('cd:')) {
+    return handleConfirm(token, studioId, cbq)
+  }
 
   if (data === 'toggle_reminders') {
     const cur = await getClientTelegramSettings(studioId, telegramId)
-    const newVal = cur.notify_before_hours > 0 ? 0 : 24
+    const newVal = cur?.notify_before_hours > 0 ? 0 : 24
     await updateClientTelegram(studioId, telegramId, { notify_before_hours: newVal })
     await tg(token, 'answerCallbackQuery', { callback_query_id: cbq.id, text: '✅ Сохранено' })
+
+    const settings = await getClientTelegramSettings(studioId, telegramId)
+    await tg(token, 'editMessageText', {
+      chat_id: chatId,
+      message_id: cbq.message.message_id,
+      text: `🔔 <b>Настройки уведомлений</b>\n\n` +
+        `⚠️ Напоминание о балансе — всегда включено\n` +
+        `📅 Напоминания о занятиях (утром): <b>${settings?.notify_before_hours > 0 ? 'включено' : 'выключено'}</b>`,
+      parse_mode: 'HTML',
+      ...notifyMenu(settings || {}),
+    })
+    return
   }
 
-  const settings = await getClientTelegramSettings(studioId, telegramId)
-
-  await tg(token, 'editMessageText', {
-    chat_id: chatId,
-    message_id: cbq.message.message_id,
-    text: `🔔 <b>Настройки уведомлений</b>\n\n` +
-      `⚠️ Напоминание о балансе — всегда включено\n` +
-      `📅 Напоминания о занятиях (утром): <b>${settings.notify_before_hours > 0 ? 'включено' : 'выключено'}</b>`,
-    parse_mode: 'HTML',
-    ...notifyMenu(settings),
-  })
+  // Незнакомая кнопка: гасим «часики», чтобы не висели у человека
+  await tg(token, 'answerCallbackQuery', { callback_query_id: cbq.id })
 }
 
 // ── Vercel handler ───────────────────────────────────────────
