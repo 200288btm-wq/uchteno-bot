@@ -104,8 +104,9 @@ async function alreadySent(clientId, type, referenceId) {
 }
 
 // ── Остаток занятий ──────────────────────────────────────────────────
-async function checkLowBalance(ctx, stats) {
+async function checkLowBalance(ctx, stats, opts) {
   for (const row of ctx.links) {
+    if (opts.only && String(row.telegram_id) !== opts.only) continue
     if (row.notify_low_balance !== true) continue
 
     const studio = ctx.studios.get(row.studio_id)
@@ -134,7 +135,7 @@ async function checkLowBalance(ctx, stats) {
       if (balance === 1 && maxLessons <= 1) continue
 
       const refId = today
-      if (await alreadySent(client.id, 'low_balance', refId)) continue
+      if (!opts.force && await alreadySent(client.id, 'low_balance', refId)) continue
 
       const text = balance === 1
         ? `⚠️ <b>Осталось последнее занятие</b>\n\nУ ${client.child_name} в абонементе остался <b>1 урок</b>.\nСамое время продлить 😊`
@@ -142,6 +143,10 @@ async function checkLowBalance(ctx, stats) {
           ? `⚠️ <b>Занятия закончились</b>\n\nУ ${client.child_name} в абонементе не осталось уроков.\nЧтобы не пропустить следующее занятие, продлите абонемент 😊`
           : `⚠️ <b>Занятия идут в минус</b>\n\nУ ${client.child_name} посещений больше, чем оплачено: <b>${Math.abs(balance)}</b>.\nПожалуйста, свяжитесь с администратором студии.`
 
+      if (opts.dry) {
+        stats.plan.push(`low_balance → ${client.child_name} (остаток ${balance})`)
+        continue
+      }
       await sendMessage(studio.bot_token, row.telegram_id, text)
       await insertNotificationLog({
         studio_id: row.studio_id, client_id: client.id,
@@ -156,8 +161,9 @@ async function checkLowBalance(ctx, stats) {
 }
 
 // ── Напоминания о занятиях ───────────────────────────────────────────
-async function checkLessonReminders(ctx, stats) {
+async function checkLessonReminders(ctx, stats, opts) {
   for (const row of ctx.links) {
+    if (opts.only && String(row.telegram_id) !== opts.only) continue
     // Тумблер в боте пишет именно сюда. Раньше фильтр смотрел не в то поле.
     if (!(row.notify_before_hours > 0)) continue
 
@@ -194,8 +200,12 @@ async function checkLessonReminders(ctx, stats) {
             const timeStr = timeMatch ? `${timeMatch[1]}:${timeMatch[2]}` : ''
             const refId = `${checkDate}_${dir.id}_${group.id}_morning`
 
-            if (await alreadySent(client.id, 'lesson_reminder', refId)) continue
+            if (!opts.force && await alreadySent(client.id, 'lesson_reminder', refId)) continue
 
+            if (opts.dry) {
+              stats.plan.push(`lesson_reminder → ${client.child_name}: ${label} ${dir.name}${timeStr ? ' ' + timeStr : ''}`)
+              continue
+            }
             // Кнопки «Придём / Не сможем». Ключ занятия едет в
             // callback_data — в базе занятия нет, привязаться не к чему
             await sendMessage(studio.bot_token, row.telegram_id,
@@ -225,17 +235,36 @@ export default async function handler(req, res) {
     return res.status(401).json({ error: 'Unauthorized' })
   }
 
+  // Режимы для ручной проверки. Без них единственный способ проверить
+  // рассылку — отправить её всем настоящим родителям и надеяться.
+  //
+  //   ?dry=1            показать, что ушло бы, и не отправлять
+  //   ?only=<telegram>  работать только с одним получателем
+  //   ?force=1          игнорировать журнал и слать повторно
+  //
+  // Проверка на себе: ?only=СВОЙ_ID&force=1
+  const opts = {
+    dry: req.query.dry === '1',
+    force: req.query.force === '1',
+    only: req.query.only ? String(req.query.only) : null,
+  }
+
   // skipped_status — сколько раз уведомление не ушло из-за статуса.
   // Без счётчика фильтр работал бы молча, и «бот перестал писать»
   // пришлось бы искать вслепую.
-  const stats = { low_balance: 0, lesson_reminder: 0, skipped_status: 0, errors: [] }
+  const stats = { low_balance: 0, lesson_reminder: 0, skipped_status: 0, errors: [], plan: [] }
   try {
     const ctx = await loadContext()
-    await checkLowBalance(ctx, stats)
-    await checkLessonReminders(ctx, stats)
-    // В логах Vercel только счётчики — ни имён, ни телефонов
-    console.log('notifications:', JSON.stringify({ ...stats, errors: stats.errors.length }))
-    res.json({ ok: true, ...stats })
+    await checkLowBalance(ctx, stats, opts)
+    await checkLessonReminders(ctx, stats, opts)
+    // В логах Vercel только счётчики — ни имён, ни телефонов.
+    // plan содержит имена детей, поэтому уходит только в ответ
+    console.log('notifications:', JSON.stringify({
+      low_balance: stats.low_balance, lesson_reminder: stats.lesson_reminder,
+      skipped_status: stats.skipped_status, errors: stats.errors.length,
+      planned: stats.plan.length, mode: opts,
+    }))
+    res.json({ ok: true, mode: opts, ...stats })
   } catch (e) {
     console.error('Notifications failed:', e.message)
     res.status(500).json({ error: 'internal' })
