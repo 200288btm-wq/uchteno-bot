@@ -7,6 +7,11 @@ import {
   sbGet
 } from '../../lib/helpers.js'
 
+// Напоминания о занятиях выключены при новой привязке, пока не починен баг 54:
+// крон не смотрит на подгруппу ребёнка и берёт первое время из всей строки расписания.
+// Вернуть 24 после переноса разбора расписания в lib/schedule.js бота.
+const DEFAULT_NOTIFY_BEFORE_HOURS = 0
+
 // ── Message handler ──────────────────────────────────────────
 async function handleMessage(token, studioSettings, msg) {
   const chatId = msg.chat.id
@@ -39,7 +44,7 @@ async function handleMessage(token, studioSettings, msg) {
     await upsertClientTelegram({
       studio_id: studioId, client_id: client.id, telegram_id: telegramId,
       telegram_username: msg.from.username, telegram_first_name: msg.from.first_name,
-      phone, notify_before_hours: 2, notify_low_balance: true,
+      phone, notify_before_hours: DEFAULT_NOTIFY_BEFORE_HOURS, notify_low_balance: true,
     })
     await deletePendingReg(telegramId)
     await sendMessage(token, chatId,
@@ -69,7 +74,7 @@ async function handleMessage(token, studioSettings, msg) {
       await upsertClientTelegram({
         studio_id: studioId, client_id: client.id, telegram_id: telegramId,
         telegram_username: msg.from.username, telegram_first_name: msg.from.first_name,
-        phone, notify_before_hours: 2, notify_low_balance: true,
+        phone, notify_before_hours: DEFAULT_NOTIFY_BEFORE_HOURS, notify_low_balance: true,
       })
       await deletePendingReg(telegramId)
       await sendMessage(token, chatId,

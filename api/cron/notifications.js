@@ -231,7 +231,15 @@ async function checkLessonReminders(ctx, stats, opts) {
 
 // ── Точка входа ──────────────────────────────────────────────────────
 export default async function handler(req, res) {
-  if (req.headers['authorization'] !== `Bearer ${process.env.CRON_SECRET}`) {
+  // Секрет обязателен. Без него сравнение шло бы со строкой «Bearer undefined»,
+  // и рассылку по всем студиям мог бы запустить кто угодно (баг 58).
+  const cronSecret = process.env.CRON_SECRET
+  if (!cronSecret) {
+    console.error('CRON_SECRET не задан — рассылка остановлена')
+    return res.status(500).json({ error: 'CRON_SECRET is not configured' })
+  }
+
+  if (req.headers['authorization'] !== `Bearer ${cronSecret}`) {
     return res.status(401).json({ error: 'Unauthorized' })
   }
 
