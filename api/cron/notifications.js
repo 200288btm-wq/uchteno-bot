@@ -183,7 +183,7 @@ async function checkLessonReminders(ctx, stats, opts) {
 
       const directions = await sbGet(
         'directions',
-        `studio_id=eq.${row.studio_id}&id=in.(${dirIds.join(',')})&select=id,name,groups:direction_groups(id,schedule)`
+        `studio_id=eq.${row.studio_id}&id=in.(${dirIds.join(',')})&select=id,name,groups:direction_groups(id,schedule,archived_at)`
       )
       if (!directions?.length) continue
 
@@ -193,6 +193,14 @@ async function checkLessonReminders(ctx, stats, opts) {
 
         for (const dir of directions) {
           for (const group of (dir.groups || [])) {
+            // Убранное из расписания время занятий больше не даёт —
+            // звать на него родителей нельзя. Фильтруем здесь, а не
+            // в запросе: вложенный фильтр PostgREST при пустом
+            // результате выкидывает и само направление.
+            // Напоминание всегда про сегодня или завтра, поэтому,
+            // в отличие от календаря, дата архивации не нужна:
+            // достаточно того, что подгруппа убрана.
+            if (group.archived_at) continue
             const schedule = (group.schedule || '').toLowerCase()
             if (!schedule.includes(dayRu)) continue
 
