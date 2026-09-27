@@ -12,31 +12,29 @@
 //      Настройки студий грузятся отдельным запросом и кладутся в Map.
 //   8. Даты считаются в поясе студии, а не в UTC.
 //   9. Ошибка по одному родителю больше не роняет всю рассылку.
+//
+// Заход 12, 27.09.2026 — баги 54 и 59:
+//  54. Кто на каком занятии, теперь решает функция базы schedule_lessons,
+//      а не своя копия правил. Своя копия брала первое время в строке,
+//      искала день подстрокой, не видела направлений без подгрупп
+//      и слала ребёнку напоминания обо ВСЕХ подгруппах направления.
+//  59. Напоминания о занятиях идут, только если студия включила их
+//      общим выключателем (studio_settings.lesson_reminders). Тумблер
+//      родителя действует внутри него.
+//
+// Заход 13 — баг 57: журнал пишется ДО отправки (deliver ниже).
+// Ответ Телеграма проверяется: счётчик «отправлено» = «Телеграм принял».
 // =====================================================================
 
-import { sbGet, sendMessage, insertNotificationLog, confirmMenu } from '../../lib/helpers.js'
+import { sbGet, sbRpc, sendMessage, claimNotification, releaseNotification, confirmMenu, localToday } from '../../lib/helpers.js'
 
-const DAYS_RU = ['вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб']
-
-// Местная дата студии. toISOString() отдал бы UTC — в UTC+5 это вчера.
-function localToday(tz = 'Asia/Yekaterinburg') {
-  const fmt = new Intl.DateTimeFormat('en-CA', {
-    timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
-  })
-  const p = Object.fromEntries(fmt.formatToParts(new Date()).map(x => [x.type, x.value]))
-  return `${p.year}-${p.month}-${p.day}`
-}
+// Местная дата студии — localToday из lib/helpers.js, одна на весь бот.
 
 function shiftDays(isoDate, days) {
   const [y, m, d] = isoDate.split('-').map(Number)
   const dt = new Date(Date.UTC(y, m - 1, d))
   dt.setUTCDate(dt.getUTCDate() + days)
   return dt.toISOString().slice(0, 10)   // дата собрана в UTC — сдвига нет
-}
-
-const weekdayRu = (isoDate) => {
-  const [y, m, d] = isoDate.split('-').map(Number)
-  return DAYS_RU[new Date(Date.UTC(y, m - 1, d)).getUTCDay()]
 }
 
 // ── Статус клиента: что он разрешает ─────────────────────────────────
@@ -76,7 +74,7 @@ async function loadContext() {
   const clientIds = [...new Set(links.map(l => l.client_id).filter(Boolean))]
 
   const settings = studioIds.length
-    ? await sbGet('studio_settings', `studio_id=in.(${studioIds.join(',')})&select=studio_id,bot_token,timezone`)
+    ? await sbGet('studio_settings', `studio_id=in.(${studioIds.join(',')})&select=studio_id,bot_token,timezone,lesson_reminders`)
     : []
   const clients = clientIds.length
     ? await sbGet('clients', `id=in.(${clientIds.join(',')})&select=*`)
@@ -101,6 +99,33 @@ async function alreadySent(clientId, type, referenceId) {
     `client_id=eq.${clientId}&type=eq.${type}&reference_id=eq.${encodeURIComponent(referenceId)}&limit=1`
   )
   return Array.isArray(rows) && rows.length > 0
+}
+
+// ── Отправка одного уведомления (баг 57) ─────────────────────────────
+//
+// 1. Занять строку журнала. Не заняли — уже отправляли: молчим.
+// 2. Отправить.
+// 3. Телеграм ответил ok: false (заблокировал бота, неверный чат) —
+//    сообщение точно не ушло: слот отдаём, следующий запуск попробует снова.
+//    Оборвалась сеть и ответа нет — неизвестно, дошло ли: слот держим.
+//
+// force (?force=1) — проверка на себе: шлём, даже если слот занят.
+// Возвращает 'sent' | 'already' и бросает на сбое.
+async function deliver(log, send, opts) {
+  const mine = await claimNotification(log)
+  if (!mine && !opts.force) return 'already'
+
+  let r
+  try {
+    r = await send()
+  } catch (e) {
+    throw new Error(`не знаем, дошло ли (слот оставлен): ${e.message}`)
+  }
+  if (!r?.ok) {
+    if (mine) await releaseNotification(log)
+    throw new Error(`Телеграм не принял: ${r?.error_code || '?'} ${r?.description || ''}`.trim())
+  }
+  return 'sent'
 }
 
 // ── Остаток занятий ──────────────────────────────────────────────────
@@ -147,12 +172,11 @@ async function checkLowBalance(ctx, stats, opts) {
         stats.plan.push(`low_balance → ${client.child_name} (остаток ${balance})`)
         continue
       }
-      await sendMessage(studio.bot_token, row.telegram_id, text)
-      await insertNotificationLog({
+      const r = await deliver({
         studio_id: row.studio_id, client_id: client.id,
         telegram_id: row.telegram_id, type: 'low_balance', reference_id: refId,
-      })
-      stats.low_balance++
+      }, () => sendMessage(studio.bot_token, row.telegram_id, text), opts)
+      if (r === 'sent') stats.low_balance++
     } catch (e) {
       // Один упавший родитель не должен обрывать рассылку остальным
       stats.errors.push(`low_balance/link ${row.id}: ${e.message}`)
@@ -161,78 +185,110 @@ async function checkLowBalance(ctx, stats, opts) {
 }
 
 // ── Напоминания о занятиях ───────────────────────────────────────────
+//
+// Кто на каком занятии, решает функция базы schedule_lessons — ОДНО
+// место с правилами состава: три режима записи, подгруппы ребёнка,
+// архив направлений и подгрупп по дате, разовые записи, статусы.
+// Календарь CRM сверен с ней общим набором проверок.
+//
+// Здесь только «кому писать»: общий выключатель студии, тумблер
+// родителя и пометка «занятия не было».
 async function checkLessonReminders(ctx, stats, opts) {
+  // Расписание грузится один раз на студию, а не на каждого родителя
+  const byStudio = new Map()
   for (const row of ctx.links) {
     if (opts.only && String(row.telegram_id) !== opts.only) continue
-    // Тумблер в боте пишет именно сюда. Раньше фильтр смотрел не в то поле.
+    // Тумблер родителя (в боте) или администратора (в CRM)
     if (!(row.notify_before_hours > 0)) continue
+    if (!byStudio.has(row.studio_id)) byStudio.set(row.studio_id, [])
+    byStudio.get(row.studio_id).push(row)
+  }
 
-    const studio = ctx.studios.get(row.studio_id)
-    const client = ctx.clients.get(row.client_id)
-    if (!studio?.bot_token || !client) continue
+  for (const [studioId, rows] of byStudio) {
+    const studio = ctx.studios.get(studioId)
+    if (!studio?.bot_token) continue
 
-    // В расписании его нет — напоминать не о чем
-    if (!statusAllows(ctx, row, client, 'in_schedule')) { stats.skipped_status++; continue }
+    // Общий выключатель студии (баг 59). Выключен — не пишем никому,
+    // что бы ни стояло у родителей. Счётчик, чтобы тишина была объяснимой
+    if (studio.lesson_reminders !== true) { stats.skipped_studio_off += rows.length; continue }
 
+    let lessons, dirName, noWork
     try {
-      const dirIds = client.direction_ids || []
-      if (!dirIds.length) continue
-
       const today = localToday(studio.timezone)
       const tomorrow = shiftDays(today, 1)
+      lessons = await sbRpc('schedule_lessons', { p_studio_id: studioId, p_from: today, p_to: tomorrow })
+      if (!lessons?.length) continue
 
-      const directions = await sbGet(
-        'directions',
-        `studio_id=eq.${row.studio_id}&id=in.(${dirIds.join(',')})&select=id,name,groups:direction_groups(id,schedule,archived_at)`
-      )
-      if (!directions?.length) continue
+      const dirIds = [...new Set(lessons.map(l => l.direction_id))]
+      const directions = await sbGet('directions', `studio_id=eq.${studioId}&id=in.(${dirIds.join(',')})&select=id,name`)
+      dirName = new Map((directions || []).map(d => [d.id, d.name]))
 
-      for (const checkDate of [today, tomorrow]) {
-        const dayRu = weekdayRu(checkDate)
-        const label = checkDate === today ? 'Сегодня' : 'Завтра'
+      // «Занятия не было» — если пометку поставили заранее, звать некуда
+      const nw = await sbGet('lesson_no_work', `studio_id=eq.${studioId}&date=gte.${today}&date=lte.${tomorrow}&select=date,direction_id,group_id`)
+      noWork = new Set((nw || []).map(n => `${n.date}|${n.direction_id}|${n.group_id || 0}`))
+      lessons.forEach(l => { l._label = l.lesson_date === today ? 'Сегодня' : 'Завтра' })
+    } catch (e) {
+      stats.errors.push(`lesson_reminder/studio ${studioId}: ${e.message}`)
+      continue
+    }
 
-        for (const dir of directions) {
-          for (const group of (dir.groups || [])) {
-            // Убранное из расписания время занятий больше не даёт —
-            // звать на него родителей нельзя. Фильтруем здесь, а не
-            // в запросе: вложенный фильтр PostgREST при пустом
-            // результате выкидывает и само направление.
-            // Напоминание всегда про сегодня или завтра, поэтому,
-            // в отличие от календаря, дата архивации не нужна:
-            // достаточно того, что подгруппа убрана.
-            if (group.archived_at) continue
-            const schedule = (group.schedule || '').toLowerCase()
-            if (!schedule.includes(dayRu)) continue
+    for (const row of rows) {
+      const client = ctx.clients.get(row.client_id)
+      if (!client) continue
+      try {
+        const mine = lessons.filter(l => l.client_id === client.id)
 
-            const timeMatch = schedule.match(/(\d{1,2}):(\d{2})/)
-            const timeStr = timeMatch ? `${timeMatch[1]}:${timeMatch[2]}` : ''
-            const refId = `${checkDate}_${dir.id}_${group.id}_morning`
+        // Ребёнок сразу в нескольких подгруппах одного направления в один
+        // день — так бывает, когда подгруппу ему не выбрали, и по правилу он
+        // «во всех». Календарю это не страшно, а родителю пришло бы четыре
+        // напоминания с четырьмя разными временами. Какое из них верное,
+        // знает только студия — поэтому не пишем ничего и считаем, сколько
+        // таких: пусть лучше промолчим, чем позовём не туда (баг 54).
+        const perDay = new Map()
+        for (const l of mine) {
+          const k = `${l.lesson_date}|${l.direction_id}`
+          perDay.set(k, (perDay.get(k) || 0) + 1)
+        }
 
-            if (!opts.force && await alreadySent(client.id, 'lesson_reminder', refId)) continue
+        for (const l of mine) {
+          if (perDay.get(`${l.lesson_date}|${l.direction_id}`) > 1) {
+            stats.skipped_ambiguous++
+            if (opts.dry) stats.plan.push(`НЕ ОТПРАВЛЕНО → ${client.child_name}: ${l._label} ${dirName.get(l.direction_id) || ''} — несколько подгрупп сразу, выберите одну в карточке`)
+            continue
+          }
+          const gid = l.group_id || 0
+          if (noWork.has(`${l.lesson_date}|${l.direction_id}|${gid}`)) continue
 
-            if (opts.dry) {
-              stats.plan.push(`lesson_reminder → ${client.child_name}: ${label} ${dir.name}${timeStr ? ' ' + timeStr : ''}`)
-              continue
-            }
-            // Кнопки «Придём / Не сможем». Ключ занятия едет в
-            // callback_data — в базе занятия нет, привязаться не к чему
-            await sendMessage(studio.bot_token, row.telegram_id,
-              `📚 <b>${label} занятие</b>\n\n` +
-              `${label}${timeStr ? ` в <b>${timeStr}</b>` : ''} у <b>${client.child_name}</b>:\n` +
-              `<b>${dir.name}</b>\n\n` +
-              `Подскажете, будете ли?`,
-              confirmMenu(checkDate, dir.id, group.id)
-            )
-            await insertNotificationLog({
-              studio_id: row.studio_id, client_id: client.id,
+          const name = dirName.get(l.direction_id) || 'Занятие'
+          const refId = `${l.lesson_date}_${l.direction_id}_${gid}_morning`
+          if (!opts.force && await alreadySent(client.id, 'lesson_reminder', refId)) continue
+
+          if (opts.dry) {
+            stats.plan.push(`lesson_reminder → ${client.child_name}: ${l._label} ${name} ${l.lesson_time}${l.one_off ? ' (разовая запись)' : ''}`)
+            continue
+          }
+          // Кнопки «Придём / Не сможем». Ключ занятия едет в
+          // callback_data — в базе занятия нет, привязаться не к чему.
+          // Ошибка одного занятия не отменяет остальные занятия ребёнка
+          try {
+            const r = await deliver({
+              studio_id: studioId, client_id: client.id,
               telegram_id: row.telegram_id, type: 'lesson_reminder', reference_id: refId,
-            })
-            stats.lesson_reminder++
+            }, () => sendMessage(studio.bot_token, row.telegram_id,
+              `📚 <b>${l._label} занятие</b>\n\n` +
+              `${l._label} в <b>${l.lesson_time}</b> у <b>${client.child_name}</b>:\n` +
+              `<b>${name}</b>\n\n` +
+              `Подскажете, будете ли?`,
+              confirmMenu(l.lesson_date, l.direction_id, gid)
+            ), opts)
+            if (r === 'sent') stats.lesson_reminder++
+          } catch (e) {
+            stats.errors.push(`lesson_reminder/link ${row.id} ${refId}: ${e.message}`)
           }
         }
+      } catch (e) {
+        stats.errors.push(`lesson_reminder/link ${row.id}: ${e.message}`)
       }
-    } catch (e) {
-      stats.errors.push(`lesson_reminder/link ${row.id}: ${e.message}`)
     }
   }
 }
@@ -268,7 +324,7 @@ export default async function handler(req, res) {
   // skipped_status — сколько раз уведомление не ушло из-за статуса.
   // Без счётчика фильтр работал бы молча, и «бот перестал писать»
   // пришлось бы искать вслепую.
-  const stats = { low_balance: 0, lesson_reminder: 0, skipped_status: 0, errors: [], plan: [] }
+  const stats = { low_balance: 0, lesson_reminder: 0, skipped_status: 0, skipped_studio_off: 0, skipped_ambiguous: 0, errors: [], plan: [] }
   try {
     const ctx = await loadContext()
     await checkLowBalance(ctx, stats, opts)
@@ -277,7 +333,9 @@ export default async function handler(req, res) {
     // plan содержит имена детей, поэтому уходит только в ответ
     console.log('notifications:', JSON.stringify({
       low_balance: stats.low_balance, lesson_reminder: stats.lesson_reminder,
-      skipped_status: stats.skipped_status, errors: stats.errors.length,
+      skipped_status: stats.skipped_status, skipped_studio_off: stats.skipped_studio_off,
+      skipped_ambiguous: stats.skipped_ambiguous,
+      errors: stats.errors.length,
       planned: stats.plan.length, mode: opts,
     }))
     res.json({ ok: true, mode: opts, ...stats })

@@ -7,10 +7,30 @@ import {
   sbGet
 } from '../../lib/helpers.js'
 
-// Напоминания о занятиях выключены при новой привязке, пока не починен баг 54:
-// крон не смотрит на подгруппу ребёнка и берёт первое время из всей строки расписания.
-// Вернуть 24 после переноса разбора расписания в lib/schedule.js бота.
-const DEFAULT_NOTIFY_BEFORE_HOURS = 0
+// Тумблер родителя «напоминания о занятиях». Крон смотрит только на > 0:
+// число часов нигде не применяется, напоминание всегда утреннее.
+// Одно значение «включено» на весь бот — раньше их было два, 2 и 24 (баг 59).
+const REMINDERS_ON = 24
+const REMINDERS_OFF = 0
+
+// Новая привязка приходит ВКЛЮЧЁННОЙ (баг 59). Рассылкой управляет
+// общий выключатель студии в CRM (studio_settings.lesson_reminders):
+// пока он выключен, не уходит никому, какой бы тумблер ни стоял здесь.
+// Раньше здесь стоял 0 как временная мера от бага 54 — и новые родители
+// оставались без напоминаний навсегда, даже после починки.
+const DEFAULT_NOTIFY_BEFORE_HOURS = REMINDERS_ON
+
+// Текст экрана «Настройки уведомлений». Один на два места: открытие
+// меню и нажатие тумблера. Если студия напоминания ещё не включила,
+// честно говорим, что включённый тумблер пока ничего не даст.
+function notifySettingsText(link, studioSettings) {
+  const on = link?.notify_before_hours > 0
+  const studioOff = studioSettings?.lesson_reminders !== true
+  return `🔔 <b>Настройки уведомлений</b>\n\n` +
+    `⚠️ Напоминание о балансе — всегда включено\n` +
+    `📅 Напоминания о занятиях (утром): <b>${on ? 'включено' : 'выключено'}</b>` +
+    (on && studioOff ? `\n\n<i>Студия пока не рассылает напоминания. Как только включит — они начнут приходить.</i>` : '')
+}
 
 // ── Message handler ──────────────────────────────────────────
 async function handleMessage(token, studioSettings, msg) {
@@ -112,7 +132,7 @@ async function handleMessage(token, studioSettings, msg) {
   }
 
   if (text === '💳 Оплаты и баланс') {
-    const { totalPaid, totalVisited, balance, payments } = await getClientBalance(studioId, client.id)
+    const { totalPaid, totalVisited, balance, payments } = await getClientBalance(studioId, client.id, studioSettings.timezone)
     const lastPayments = payments
       .sort((a, b) => new Date(b.payment_date) - new Date(a.payment_date))
       .slice(0, 5)
@@ -149,12 +169,7 @@ async function handleMessage(token, studioSettings, msg) {
 
   if (text === '🔔 Настройки уведомлений') {
     const settings = await getClientTelegramSettings(studioId, telegramId)
-    await sendMessage(token, chatId,
-      `🔔 <b>Настройки уведомлений</b>\n\n` +
-      `⚠️ Напоминание о балансе — всегда включено\n` +
-      `📅 Напоминания о занятиях (утром): <b>${settings.notify_before_hours > 0 ? 'включено' : 'выключено'}</b>`,
-      notifyMenu(settings)
-    )
+    await sendMessage(token, chatId, notifySettingsText(settings, studioSettings), notifyMenu(settings || {}))
     return
   }
 
@@ -226,7 +241,7 @@ async function handleCallback(token, studioSettings, cbq) {
 
   if (data === 'toggle_reminders') {
     const cur = await getClientTelegramSettings(studioId, telegramId)
-    const newVal = cur?.notify_before_hours > 0 ? 0 : 24
+    const newVal = cur?.notify_before_hours > 0 ? REMINDERS_OFF : REMINDERS_ON
     await updateClientTelegram(studioId, telegramId, { notify_before_hours: newVal })
     await tg(token, 'answerCallbackQuery', { callback_query_id: cbq.id, text: '✅ Сохранено' })
 
@@ -234,9 +249,7 @@ async function handleCallback(token, studioSettings, cbq) {
     await tg(token, 'editMessageText', {
       chat_id: chatId,
       message_id: cbq.message.message_id,
-      text: `🔔 <b>Настройки уведомлений</b>\n\n` +
-        `⚠️ Напоминание о балансе — всегда включено\n` +
-        `📅 Напоминания о занятиях (утром): <b>${settings?.notify_before_hours > 0 ? 'включено' : 'выключено'}</b>`,
+      text: notifySettingsText(settings, studioSettings),
       parse_mode: 'HTML',
       ...notifyMenu(settings || {}),
     })
