@@ -1,7 +1,7 @@
 import {
   tg, sendMessage, mainMenu, notifyMenu,
   getStudioByToken, getClientByTelegram, findClientByPhone,
-  getClientBalance, getPendingReg, setPendingReg, deletePendingReg,
+  getClientBalance, poolLabel, ruDate, getPendingReg, setPendingReg, deletePendingReg,
   upsertClientTelegram, updateClientTelegram, getClientTelegramSettings,
   confirmMenu, saveConfirmation,
   sbGet
@@ -132,20 +132,41 @@ async function handleMessage(token, studioSettings, msg) {
   }
 
   if (text === '💳 Оплаты и баланс') {
-    const { totalPaid, totalVisited, balance, payments } = await getClientBalance(studioId, client.id, studioSettings.timezone)
+    const { totalPaid, totalVisited, summary, refs, payments } =
+      await getClientBalance(studioId, client.id, studioSettings.balance_mode)
     const lastPayments = payments
-      .sort((a, b) => new Date(b.payment_date) - new Date(a.payment_date))
+      .sort((a, b) => String(b.payment_date).localeCompare(String(a.payment_date)))
       .slice(0, 5)
       .map(p => {
-        const date = new Date(p.payment_date).toLocaleDateString('ru-RU')
-        const exp = p.expires_at ? ` (до ${new Date(p.expires_at).toLocaleDateString('ru-RU')})` : ''
+        const date = ruDate(p.payment_date)
+        const exp = p.expires_at ? ` (до ${ruDate(p.expires_at)})` : ''
         return `• ${date}: ${p.payment_type} ${p.amount ? `— ${p.amount}₽` : ''}${exp}`
       }).join('\n')
 
-    const balanceEmoji = balance > 0 ? '✅' : balance === 0 ? '⚠️' : '❌'
+    // Остаток — по функции базы, как в CRM. Несколько кошельков —
+    // строка на каждый: занятия одного не покрывают другой
+    const sign = (n) => (n > 0 ? `${n}` : n < 0 ? `−${-n}` : '0')
+    const emoji = (n) => (n > 0 ? '✅' : n === 0 ? '⚠️' : '❌')
+    let balanceText
+    if (summary.unlimitedUntil) {
+      balanceText = `♾ Безлимит${summary.unlimitedUntil === 'infinity' ? '' : ` до <b>${ruDate(summary.unlimitedUntil)}</b>`}\n`
+      for (const p of summary.pools.filter(p => p.left < 0)) {
+        const label = poolLabel(p.poolId, refs, client)
+        balanceText += `❌ ${label ? `${label}: ` : ''}<b>${sign(p.left)} зан.</b> (до безлимита)\n`
+      }
+    } else if (summary.pools.length > 1) {
+      balanceText = summary.pools.map(p => {
+        const label = poolLabel(p.poolId, refs, client)
+        return `${emoji(p.left)} ${label ? `${label}: ` : ''}<b>${sign(p.left)} зан.</b>`
+      }).join('\n') + '\n'
+    } else {
+      const left = summary.pools[0]?.left || 0
+      balanceText = `${emoji(left)} Баланс: <b>${sign(left)} зан.</b>\n`
+    }
+
     await sendMessage(token, chatId,
       `💳 <b>Оплаты и баланс</b>\n\n` +
-      `${balanceEmoji} Баланс: <b>${balance} зан.</b>\n` +
+      balanceText +
       `📊 Оплачено всего: ${totalPaid} зан.\n` +
       `✅ Посещено: ${totalVisited} зан.\n\n` +
       `<b>Последние оплаты:</b>\n${lastPayments || 'Оплат пока нет'}`
