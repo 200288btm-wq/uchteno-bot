@@ -4,7 +4,7 @@ import {
   getClientBalance, poolLabel, ruDate, getPendingReg, setPendingReg, deletePendingReg,
   upsertClientTelegram, updateClientTelegram, getClientTelegramSettings,
   confirmMenu, saveConfirmation,
-  sbGet
+  sbGet, studiosWithFeature, featureAllows
 } from '../../lib/helpers.js'
 
 // Тумблер родителя «напоминания о занятиях». Крон смотрит только на > 0:
@@ -294,6 +294,15 @@ export default async function handler(req, res) {
     console.log('studioSettings:', studioSettings ? 'found' : 'not found')
 
     if (!studioSettings) { console.log('Unknown token:', token); return res.status(200).json({ ok: true }) }
+
+    // Клиентский бот — по тарифу (заход 18). Нет в тарифе — один ответ
+    // на сообщение, чтобы родитель не писал в пустоту; кнопки молчат
+    const botOn = await studiosWithFeature('client_bot')
+    if (!featureAllows(botOn, studioSettings.studio_id)) {
+      const chatId = update.message?.chat?.id
+      if (chatId) await sendMessage(token, chatId, 'Бот студии сейчас не работает. Свяжитесь, пожалуйста, со студией напрямую.')
+      return res.status(200).json({ ok: true })
+    }
 
     if (update.message) await handleMessage(token, studioSettings, update.message)
     if (update.callback_query) await handleCallback(token, studioSettings, update.callback_query)

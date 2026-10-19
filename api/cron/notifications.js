@@ -27,7 +27,7 @@
 // =====================================================================
 
 import { sbGet, sbRpc, sendMessage, claimNotification, releaseNotification, confirmMenu, localToday,
-  getBalances, summarizeBalance, loadPoolRefs, poolLabel } from '../../lib/helpers.js'
+  getBalances, summarizeBalance, loadPoolRefs, poolLabel, studiosWithFeature, featureAllows } from '../../lib/helpers.js'
 
 // Местная дата студии — localToday из lib/helpers.js, одна на весь бот.
 
@@ -68,7 +68,7 @@ function statusAllows(ctx, row, client, flag) {
 async function loadContext() {
   const links = await sbGet('client_telegram', 'select=*')
   if (!Array.isArray(links) || !links.length) {
-    return { links: [], studios: new Map(), clients: new Map(), statuses: new Map() }
+    return { links: [], tariffAllows: () => true, studios: new Map(), clients: new Map(), statuses: new Map() }
   }
 
   const studioIds = [...new Set(links.map(l => l.studio_id).filter(Boolean))]
@@ -84,8 +84,13 @@ async function loadContext() {
     ? await sbGet('client_statuses', `studio_id=in.(${studioIds.join(',')})&select=studio_id,name,in_schedule,in_stats`)
     : []
 
+  // Тариф (заход 18): рассылки только студиям, у которых в тарифе есть
+  // и клиентский бот, и напоминания. null — тариф не узнали, не режем
+  const [botOn, remindOn] = await Promise.all([studiosWithFeature('client_bot'), studiosWithFeature('reminders')])
+
   return {
     links,
+    tariffAllows: (studioId) => featureAllows(botOn, studioId) && featureAllows(remindOn, studioId),
     studios: new Map((settings || []).map(s => [s.studio_id, s])),
     clients: new Map((clients || []).map(c => [c.id, c])),
     // Ключ со studio_id: названия статусов у студий свои и совпадают
@@ -164,6 +169,7 @@ async function checkLowBalance(ctx, stats, opts) {
     const studio = ctx.studios.get(row.studio_id)
     const client = ctx.clients.get(row.client_id)
     if (!studio?.bot_token || !client) continue
+    if (!ctx.tariffAllows(row.studio_id)) { stats.skipped_tariff++; continue }
 
     // Архивный из списка должников в CRM пропал — значит и писать ему
     // про долг больше некому и незачем
@@ -253,6 +259,7 @@ async function checkLessonReminders(ctx, stats, opts) {
     // Общий выключатель студии (баг 59). Выключен — не пишем никому,
     // что бы ни стояло у родителей. Счётчик, чтобы тишина была объяснимой
     if (studio.lesson_reminders !== true) { stats.skipped_studio_off += rows.length; continue }
+    if (!ctx.tariffAllows(studioId)) { stats.skipped_tariff += rows.length; continue }
 
     let lessons, dirName, noWork
     try {
@@ -366,7 +373,7 @@ export default async function handler(req, res) {
   // skipped_status — сколько раз уведомление не ушло из-за статуса.
   // Без счётчика фильтр работал бы молча, и «бот перестал писать»
   // пришлось бы искать вслепую.
-  const stats = { low_balance: 0, lesson_reminder: 0, skipped_status: 0, skipped_studio_off: 0, skipped_ambiguous: 0, errors: [], plan: [] }
+  const stats = { low_balance: 0, lesson_reminder: 0, skipped_status: 0, skipped_studio_off: 0, skipped_tariff: 0, skipped_ambiguous: 0, errors: [], plan: [] }
   try {
     const ctx = await loadContext()
     await checkLowBalance(ctx, stats, opts)
@@ -376,6 +383,7 @@ export default async function handler(req, res) {
     console.log('notifications:', JSON.stringify({
       low_balance: stats.low_balance, lesson_reminder: stats.lesson_reminder,
       skipped_status: stats.skipped_status, skipped_studio_off: stats.skipped_studio_off,
+      skipped_tariff: stats.skipped_tariff,
       skipped_ambiguous: stats.skipped_ambiguous,
       errors: stats.errors.length,
       planned: stats.plan.length, mode: opts,
